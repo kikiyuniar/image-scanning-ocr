@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+opencv-python
+numpy
+pillow
+pillow-heif
+paddleocr==2.9.1
+paddlepaddle==2.6.2
