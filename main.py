@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from paddleocr import PaddleOCR
 from PIL import Image, ImageOps
@@ -8,11 +8,11 @@ from dotenv import load_dotenv
 
 import cv2
 import numpy as np
+import pandas as pd  # Ditambahkan untuk handle Excel/CSV
 import re
 import os
 import io
 import time
-
 
 load_dotenv()
 register_heif_opener()
@@ -23,25 +23,23 @@ APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 5000))
 
-MAX_FILE_SIZE = int(
-    os.getenv("MAX_FILE_SIZE", 10485760)
-)
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 10485760))
 
-VALID_EXTENSIONS = (
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-    ".bmp",
-    ".heic"
-)
+VALID_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic")
+VALID_EXCEL_EXTENSIONS = (".xlsx", ".xls", ".csv")
+
+# Definisi header wajib untuk import data penduduk
+EXPECTED_HEADERS = [
+    'alamat', 'dusun', 'rw', 'rt', 'nama', 'no_kk', 'nik', 
+    'sex', 'tempatlahir', 'tanggallahir', 'nama_ayah', 'nama_ibu'
+]
 
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["FLAGS_allocator_strategy"] = "auto_growth"
 
 app = FastAPI(
     title=APP_NAME,
-    description="REST API OCR Kartu Keluarga menggunakan PaddleOCR",
+    description="REST API OCR Kartu Keluarga & Import Data Penduduk",
     version=APP_VERSION
 )
 
@@ -58,311 +56,238 @@ ocr = PaddleOCR(
 # ==========================================
 # RESPONSE HELPER
 # ==========================================
-def error_response(
-    code: str,
-    message: str,
-    detail=None
-):
+def error_response(code: str, message: str, detail=None):
     response = {
         "status": "error",
         "error_code": code,
         "message": message
     }
-
     if detail:
         response["detail"] = str(detail)
-
     return response
 
+# ==========================================
+# IMPORT EXCEL / CSV DATA PENDUDUK (NEW)
+# ==========================================
+@app.post("/import-penduduk")
+async def import_penduduk(file: UploadFile = File(...)):
+    filename = file.filename.lower()
+    
+    if not filename.endswith(VALID_EXCEL_EXTENSIONS):
+        return error_response(
+            "INVALID_FILE_FORMAT", 
+            "Format file tidak didukung. Harus berupa .xlsx, .xls, atau .csv"
+        )
+    
+    try:
+        contents = await file.read()
+        
+        # Ambil bytes data, paksa semua kolom menjadi string sejak awal (dtype=str)
+        if filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contents), dtype=str)
+        else:
+            df = pd.read_excel(io.BytesIO(contents), dtype=str)
+        
+        # Bersihkan spasi pada header
+        df.columns = df.columns.str.strip()
+        current_headers = df.columns.tolist()
+        
+        # Pengecekan Header
+        missing_headers = [h for h in EXPECTED_HEADERS if h not in current_headers]
+        if missing_headers:
+            return error_response(
+                "INVALID_HEADER_STRUCTURE",
+                f"Struktur kolom dokumen salah. Kolom berikut wajib ada: {', '.join(missing_headers)}"
+            )
+            
+        # PENTING: Bersihkan data kosong (NaN/None) dan pastikan murni string standar Python
+        df = df.astype(str).replace(['nan', 'NaN', 'None', '<NA>'], '')
+        df = df.fillna("")
+        
+        total_rows = len(df)
+        
+        # Gunakan orient="records" namun kita pastikan lagi tipenya aman untuk json serializer fastapi
+        data_records = df.to_dict(orient="records")
+        
+        return {
+            "status": "success",
+            "message": f"Berhasil memproses {total_rows} data penduduk.",
+            "total": total_rows,
+            "data": data_records
+        }
+        
+    except Exception as e:
+        return error_response(
+            "IMPORT_FAILED",
+            "Terjadi kesalahan saat mengekstrak file excel/csv",
+            str(e)
+        )
 
 # ==========================================
 # SCAN OCR
 # ==========================================
 @app.post("/scan")
 async def scan_kk(file: UploadFile = File(...)):
-
-    total_start = time.time()
-
     try:
-
         filename = file.filename.lower()
-
-        if not filename.endswith(VALID_EXTENSIONS):
-
-            return error_response(
-                "INVALID_FILE_FORMAT",
-                "Format file tidak didukung"
-            )
+        
+        # ==========================================
+        # VALIDASI EKSTENSI
+        # ==========================================
+        valid_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.heic')
+        if not filename.endswith(valid_extensions):
+            return {
+                "status": "error", 
+                "message": f"Format file '{file.filename}' tidak didukung. Harap unggah gambar (JPG/PNG/HEIC)."
+            }
 
         file_bytes = await file.read()
 
-        if len(file_bytes) == 0:
-
-            return error_response(
-                "EMPTY_FILE",
-                "File yang diunggah kosong"
-            )
-
-        if len(file_bytes) > MAX_FILE_SIZE:
-
-            return error_response(
-                "FILE_TOO_LARGE",
-                "Ukuran file maksimal 10 MB"
-            )
-
+        # ==========================================
+        # PROSES PEMBACAAN GAMBAR & ROTASI otomatis (EXIF)
+        # ==========================================
         try:
-
-            pil_img = Image.open(
-                io.BytesIO(file_bytes)
-            )
-
-            pil_img = ImageOps.exif_transpose(
-                pil_img
-            )
-
-            img = cv2.cvtColor(
-                np.array(pil_img),
-                cv2.COLOR_RGB2BGR
-            )
-
-        except Exception:
-
-            nparr = np.frombuffer(
-                file_bytes,
-                np.uint8
-            )
-
-            img = cv2.imdecode(
-                nparr,
-                cv2.IMREAD_COLOR
-            )
+            pil_img = Image.open(io.BytesIO(file_bytes))
+            # Mengatasi masalah foto miring/terbalik akibat kamera HP
+            pil_img = ImageOps.exif_transpose(pil_img)
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        except:
+            # Jalur cadangan jika pembacaan metadata PIL gagal
+            nparr = np.frombuffer(file_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
+            return {"status": "error", "message": "Gambar rusak atau tidak valid"}
 
-            return error_response(
-                "INVALID_IMAGE",
-                "Gambar rusak atau tidak valid"
-            )
-
+        # =====================
+        # UPSCALE
+        # =====================
         h, w = img.shape[:2]
+        if w < 2000:
+            scale = 2000 / w
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-        if w > 1800:
+        # =====================
+        # PREPROCESSING: GRAYSCALE
+        # =====================
+        # Mengubah ke hitam-putih agar background bising hilang dan teks lebih tajam
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            scale = 1800 / w
-
-            img = cv2.resize(
-                img,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_AREA
-            )
-
-        elif w < 1200:
-
-            scale = 1200 / w
-
-            img = cv2.resize(
-                img,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_CUBIC
-            )
-
-        gray = cv2.cvtColor(
-            img,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        gray = cv2.GaussianBlur(
-            gray,
-            (3, 3),
-            0
-        )
-
-        gray = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            15
-        )
-
-        ocr_start = time.time()
-
+        # =====================
+        # OCR (PERBAIKAN: Hapus cls=True di sini)
+        # =====================
         result = ocr.ocr(gray)
 
-        ocr_time = round(
-            time.time() - ocr_start,
-            2
-        )
-
         if not result or not result[0]:
-
             return {
                 "status": "warning",
-                "error_code": "TEXT_NOT_FOUND",
-                "message": "OCR tidak menemukan teks",
-                "ocr_time": ocr_time,
+                "message": "OCR tidak menemukan teks pada gambar",
                 "data": []
             }
 
         extracted_text = []
         full_text = []
 
+        # =====================
+        # PARSING OCR RESULT WITH SAFETY CHECK
+        # =====================
         for line in result[0]:
-
             try:
-
+                # 1. Pastikan objek 'line' tidak kosong
                 if line is None:
                     continue
-
-                if len(line) < 2:
+                
+                # 2. Pastikan struktur line memiliki minimal 2 elemen [box, [text, score]]
+                if not isinstance(line, (list, tuple)) or len(line) < 2:
                     continue
-
+                
+                # 3. Pastikan elemen kedua (indeks 1) berisi data text & score
+                if line[1] is None or len(line[1]) < 2:
+                    continue
+                    
                 text = str(line[1][0]).strip()
                 score = float(line[1][1])
 
                 if text:
-
                     extracted_text.append({
                         "text": text,
                         "confidence": round(score, 4)
                     })
-
                     full_text.append(text)
-
             except Exception:
+                # Jika ada struktur aneh lainnya, lewati dengan aman tanpa membuat server crash
                 continue
 
-        raw_text = "\n".join(full_text)
+        full_text_str = "\n".join(full_text)
 
+        # =====================
+        # EXTRACT NOMOR KK
+        # =====================
         nomor_kk = None
-
-        kk_match = re.search(
-            r"\d{16}",
-            raw_text
-        )
-
+        kk_match = re.search(r'\d{16}', full_text_str)
         if kk_match:
             nomor_kk = kk_match.group()
 
-        nik_list = list(
-            set(
-                re.findall(
-                    r"\d{16}",
-                    raw_text
-                )
-            )
-        )
+        # =====================
+        # EXTRACT NIK
+        # =====================
+        nik_list = list(set(re.findall(r'\d{16}', full_text_str)))
 
         if nomor_kk and nomor_kk in nik_list:
             nik_list.remove(nomor_kk)
 
-        total_time = round(
-            time.time() - total_start,
-            2
-        )
-
-        print("=" * 60)
-        print(f"FILE       : {file.filename}")
-        print(f"OCR TIME   : {ocr_time}s")
-        print(f"TOTAL TIME : {total_time}s")
-        print(f"KK         : {nomor_kk}")
-        print(f"JUMLAH NIK : {len(nik_list)}")
-        print("=" * 60)
-
+        # =====================
+        # RESPONSE
+        # =====================
         return {
             "status": "success",
             "filename": file.filename,
             "nomor_kk": nomor_kk,
             "jumlah_nik": len(nik_list),
             "nik": nik_list,
-            "ocr_time": ocr_time,
-            "total_time": total_time,
             "data": extracted_text,
-            "raw_text": raw_text
+            "raw_text": full_text_str
         }
 
     except Exception as e:
-
-        return error_response(
-            "INTERNAL_SERVER_ERROR",
-            "Terjadi kesalahan saat memproses OCR",
-            str(e)
-        )
-
-# ==========================================
-# COMPRESS IMAGE
-# ==========================================
-@app.post("/compress")
-async def compress_image(file: UploadFile = File(...)):
-
-    try:
-        file_bytes = await file.read()
-
-        image = Image.open(io.BytesIO(file_bytes))
-
-        if image.mode in ("RGBA", "P"):
-            image = image.convert("RGB")
-
-        # Resize jika terlalu besar
-        max_width = 1800
-
-        if image.width > max_width:
-
-            ratio = max_width / image.width
-
-            image = image.resize(
-                (
-                    max_width,
-                    int(image.height * ratio)
-                ),
-                Image.LANCZOS
-            )
-
-        # Compress
-        output = io.BytesIO()
-
-        image.save(
-            output,
-            format="JPEG",
-            quality=80,
-            optimize=True
-        )
-
-        output.seek(0)
-
-        original_name = file.filename.rsplit(".", 1)[0]
-
-        return StreamingResponse(
-            output,
-            media_type="image/jpeg",
-            headers={
-                "Content-Disposition":
-                    f'attachment; filename="{original_name}_compressed.jpg"'
-            }
-        )
-
-    except Exception as e:
-
         return {
             "status": "error",
             "message": str(e)
         }
 
 # ==========================================
+# COMPRESS IMAGE
+# ==========================================
+@app.post("/compress")
+async def compress_image(file: UploadFile = File(...)):
+    try:
+        file_bytes = await file.read()
+        image = Image.open(io.BytesIO(file_bytes))
+
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+
+        max_width = 1800
+        if image.width > max_width:
+            ratio = max_width / image.width
+            image = image.resize((max_width, int(image.height * ratio)), Image.LANCZOS)
+
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=80, optimize=True)
+        output.seek(0)
+
+        original_name = file.filename.rsplit(".", 1)[0]
+        return StreamingResponse(
+            output,
+            media_type="image/jpeg",
+            headers={"Content-Disposition": f'attachment; filename="{original_name}_compressed.jpg"'}
+        )
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ==========================================
 # RUN
 # ==========================================
 if __name__ == "__main__":
-
     import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host=HOST,
-        port=PORT,
-        reload=True
-    )
+    uvicorn.run("main:app", host=HOST, port=PORT, reload=True)
